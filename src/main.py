@@ -1,80 +1,94 @@
-"""Cold chain anomaly detection: rolling features + Isolation Forest + rules -> incidents."""
+"""Temperature anomaly detection on a real industrial sensor with labelled failures.
+
+Data: Numenta Anomaly Benchmark (NAB), realKnownCause/machine_temperature_system_failure.csv. A temperature
+sensor on a large industrial machine, 5-minute readings from Dec 2013 to Feb 2014, with four anomaly windows
+labelled by NAB (NAB notes a planned shutdown and a catastrophic failure among them).
+Also on Kaggle as boltzmannbrain/nab. Stored in data/.
+
+The same approach (rolling features + Isolation Forest + a persistence rule) is what you would use on cold room
+or freezer sensors; the units here are the machine's own temperature readings.
+"""
 from pathlib import Path
+import json
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 
 ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "data"
 OUT = ROOT / "outputs"
 OUT.mkdir(exist_ok=True)
-SPEC = {"chiller": (0.0, 5.0), "freezer": (-25.0, -15.0)}
+TRAIN_END = "2013-12-08"  # first ~6 days, before any labelled event, used to learn "normal"
 
 
-def make_data(seed=11):
-    rng = np.random.default_rng(seed)
-    ts = pd.date_range("2026-09-01", periods=30 * 288, freq="5min")
-    frames = []
-    for r in range(12):
-        kind = "chiller" if r < 7 else "freezer"
-        setpoint = 3.0 if kind == "chiller" else -20.0
-        temp = setpoint + rng.normal(0, 0.3, len(ts))
-        # defrost cycles every 6h for freezers (normal behaviour)
-        if kind == "freezer":
-            temp += np.where((ts.hour % 6 == 0) & (ts.minute < 20), 4.0, 0)
-        truth = np.zeros(len(ts), dtype=bool)
-        for _ in range(rng.integers(1, 3)):  # door left open: fast spike
-            s = rng.integers(0, len(ts) - 30)
-            temp[s:s + 12] += np.linspace(0, 8, 12)
-            truth[s:s + 12] = True
-        if r in (2, 9):  # slow compressor failure
-            s = rng.integers(len(ts) // 2, len(ts) - 400)
-            temp[s:s + 300] += np.linspace(0, 9, 300)
-            truth[s:s + 300] = True
-        frames.append(pd.DataFrame({"ts": ts, "room": f"R{r:02d}", "kind": kind,
-                                    "setpoint": setpoint, "temp_c": temp.round(2), "true_event": truth}))
-    return pd.concat(frames, ignore_index=True)
+def load_windows():
+    import gzip
+    with gzip.open(DATA / "nab_windows.json.gz", "rt") as f:
+        w = json.load(f)["realKnownCause/machine_temperature_system_failure.csv"]
+    return [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in w]
 
 
 def add_features(df):
-    g = df.groupby("room")["temp_c"]
-    df["dev"] = df.temp_c - df.setpoint
-    df["roll_mean_1h"] = g.transform(lambda s: s.rolling(12, min_periods=1).mean())
-    df["roll_std_1h"] = g.transform(lambda s: s.rolling(12, min_periods=2).std()).fillna(0)
-    df["delta_15m"] = g.diff(3).fillna(0)
-    df["dev_mean_1h"] = df.roll_mean_1h - df.setpoint
+    s = df.temp
+    df["roll_mean_1h"] = s.rolling(12, min_periods=1).mean()
+    df["roll_std_1h"] = s.rolling(12, min_periods=2).std().fillna(0)
+    df["delta_15m"] = s.diff(3).fillna(0)
+    df["dev_from_6h"] = s - s.rolling(72, min_periods=1).mean()
     return df
 
 
 def main():
-    df = add_features(make_data())
-    feats = ["dev", "roll_std_1h", "delta_15m", "dev_mean_1h"]
-    df["ml_flag"] = False
-    for kind, g in df.groupby("kind"):
-        iso = IsolationForest(contamination=0.02, random_state=0).fit(g[feats])
-        df.loc[g.index, "ml_flag"] = iso.predict(g[feats]) == -1
-    lo = df.kind.map(lambda k: SPEC[k][0])
-    hi = df.kind.map(lambda k: SPEC[k][1])
-    out_spec = (df.temp_c < lo) | (df.temp_c > hi)
-    df["rule_flag"] = out_spec.groupby(df.room).transform(lambda s: s.rolling(6, min_periods=6).sum() >= 6)
-    # require ML flag to persist 3 readings to cut noise from defrost and one-off blips
-    df["alert"] = df.rule_flag | df.ml_flag.groupby(df.room).transform(
-        lambda s: s.rolling(3, min_periods=3).sum() >= 3)
+    df = pd.read_csv(DATA / "nab_machine_temp.csv.gz", parse_dates=["timestamp"]).rename(
+        columns={"timestamp": "ts", "value": "temp"})
+    windows = load_windows()
+    df["true_window"] = False
+    for a, b in windows:
+        df.loc[df.ts.between(a, b), "true_window"] = True
+    df = add_features(df)
+    print(f"{len(df):,} readings from {df.ts.min():%Y-%m-%d} to {df.ts.max():%Y-%m-%d}, "
+          f"{len(windows)} labelled anomaly windows")
 
-    # group alerts into incidents
-    df["block"] = (df.alert != df.groupby("room").alert.shift()).cumsum()
-    inc = (df[df.alert].groupby(["room", "block"])
-           .agg(start=("ts", "min"), end=("ts", "max"), peak_temp=("temp_c", "max"),
-                readings=("ts", "size"), overlaps_true=("true_event", "any"))
-           .reset_index().drop(columns="block"))
+    feats = ["temp", "roll_std_1h", "delta_15m", "dev_from_6h"]
+    train = df[df.ts < TRAIN_END]
+    iso = IsolationForest(contamination=0.01, random_state=0).fit(train[feats])
+    df["score"] = -iso.score_samples(df[feats])
+    cut = np.quantile(-iso.score_samples(train[feats]), 0.995)  # top 0.5% of "normal" behaviour
+    df["ml_flag"] = df.score > cut
+
+    # rule: temperature below the 0.5th percentile of the training week for 30 minutes (machine running cold/stopped)
+    low = train.temp.quantile(0.005)
+    df["rule_flag"] = (df.temp < low).rolling(6, min_periods=6).sum().ge(6)
+    # ML flags must persist for 30 minutes to cut one-off blips
+    df["alert"] = df.rule_flag | df.ml_flag.rolling(6, min_periods=6).sum().ge(6)
+
+    df["block"] = (df.alert != df.alert.shift()).cumsum()
+    inc = (df[df.alert].groupby("block")
+           .agg(start=("ts", "min"), end=("ts", "max"), min_temp=("temp", "min"), max_temp=("temp", "max"),
+                readings=("ts", "size"), in_labelled_window=("true_window", "any"))
+           .reset_index(drop=True))
+    # merge alerts less than 2 hours apart into one incident
+    inc["incident"] = (inc.start - inc.end.shift() > pd.Timedelta("2h")).cumsum()
+    inc = (inc.groupby("incident").agg(start=("start", "min"), end=("end", "max"), min_temp=("min_temp", "min"),
+                                        max_temp=("max_temp", "max"), readings=("readings", "sum"),
+                                        in_labelled_window=("in_labelled_window", "any")).reset_index(drop=True))
     inc["duration_min"] = inc.readings * 5
-    inc.to_csv(OUT / "incidents.csv", index=False)
-    df.drop(columns="block").to_csv(OUT / "readings_scored.csv", index=False)
+    inc.round({"min_temp": 2, "max_temp": 2}).to_csv(OUT / "incidents.csv", index=False)
+    df.drop(columns="block").round({f: 3 for f in feats + ["score"]}).to_csv(OUT / "readings_scored.csv.gz", index=False)
 
-    true_blocks = df[df.true_event].assign(b=(df.true_event != df.groupby("room").true_event.shift()).cumsum())
-    caught = true_blocks.groupby(["room", "b"]).alert.any()
-    print(f"Incidents raised: {len(inc)}  precision: {inc.overlaps_true.mean():.0%}  "
-          f"recall: {caught.mean():.0%} of {len(caught)} real events")
+    rows = []
+    for a, b in windows:
+        hits = inc[(inc.end >= a) & (inc.start <= b)]
+        first = hits.start.min() if len(hits) else pd.NaT
+        rows.append({"window_start": a, "window_end": b, "caught": len(hits) > 0, "first_alert": first,
+                     "hours_after_window_start": round((first - a) / pd.Timedelta("1h"), 1) if len(hits) else None})
+    ev = pd.DataFrame(rows)
+    ev.to_csv(OUT / "window_recall.csv", index=False)
+    print(f"\nIncidents raised: {len(inc)}  | in a labelled window: {inc.in_labelled_window.sum()} "
+          f"(precision {inc.in_labelled_window.mean():.0%})  | windows caught: {ev.caught.sum()} of {len(ev)}")
+    print("\n" + ev.to_string(index=False))
+    print("\nIncidents:\n" + inc[["start", "end", "min_temp", "max_temp", "duration_min", "in_labelled_window"]]
+          .round({"min_temp": 1, "max_temp": 1}).to_string(index=False))
 
 
 if __name__ == "__main__":
